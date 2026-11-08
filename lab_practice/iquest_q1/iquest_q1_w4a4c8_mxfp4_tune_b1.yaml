@@ -1,0 +1,128 @@
+# IQuest-Q1 W4A4C8 (MXFP4) 精度调优变体 B-1
+#
+# 依据《量化精度调优指南》步骤 3「量化算法选择」：
+#   - MXFP4 权重量化：minmax → ceil_x（带 search），抑制大值截断
+#   - MXFP8 权重量化：minmax → mse_round（按 block 比较 ceil/floor shared
+#     exponent 的重构 MSE，择优）
+#   - 激活保持 minmax 动态（MXFP 的 act 是 data-free 运行时量化，
+#     method 只影响权重侧）
+#
+# 参考官方配方：
+#   lab_practice/gemma4_moe/gemma4_moe_mxfp8_mxfp4.yaml（ceil_x + enable_search）
+#   lab_practice/wan2_2/wan2_2_w4a4f8_mxfp_t2v.yaml（ceil_x + mse_round）
+#
+# 与基线 iquest_q1_w4a4c8_mxfp4.yaml 的唯一差异：两处 weight.method。
+apiversion: modelslim_v1
+
+metadata:
+  config_id: iquest_q1_w4a4c8_mxfp4_tune_b1
+  score: 90
+  verified_tags:
+    IQuest-Q1:
+      - - vLLM-Ascend
+        - Atlas_350
+  label:
+    w_bit: 4
+    a_bit: 4
+    is_sparse: False
+    kv_cache: True
+
+default_w8a8_mxfp_dynamic: &default_w8a8_mxfp_dynamic
+  act:
+    scope: "per_block"
+    dtype: "mxfp8"
+    symmetric: True
+    method: "minmax"
+  weight:
+    scope: "per_block"
+    dtype: "mxfp8"
+    symmetric: True
+    method: "mse_round"
+
+default_w4a4_mxfp_dynamic: &default_w4a4_mxfp_dynamic
+  act:
+    scope: "per_block"
+    dtype: "mxfp4"
+    symmetric: True
+    method: "minmax"
+  weight:
+    scope: "per_block"
+    dtype: "mxfp4"
+    symmetric: True
+    method: "ceil_x"
+    ext:
+      axes: -1
+      ceil_x_value: 7.25
+      enable_search: true
+      search_min: 6.0
+      search_max: 12.0
+      search_step: 0.25
+
+spec:
+  process:
+    - type: "linear_quant"
+      qconfig: *default_w8a8_mxfp_dynamic
+      include:
+        - "*self_attn*"
+        - "model.layers.0.mlp.gate_proj"
+        - "model.layers.0.mlp.up_proj"
+        - "model.layers.0.mlp.down_proj"
+      exclude:
+        - "*sink*"
+
+    - type: "linear_quant"
+      qconfig: *default_w4a4_mxfp_dynamic
+      include:
+        - "*mlp.experts*"
+
+    - type: "fa3_quant"
+      details:
+        fa_q:
+          dtype: "mxfp8"
+          scope: "per_block"
+          symmetric: True
+          method: "minmax"
+        fa_k:
+          dtype: "mxfp8"
+          scope: "per_block"
+          symmetric: True
+          method: "minmax"
+        fa_v:
+          dtype: "mxfp8"
+          scope: "per_channel"
+          symmetric: True
+          method: "minmax"
+      include:
+        - "model.layers.0.self_attn"
+        - "model.layers.1.self_attn"
+        - "model.layers.5.self_attn"
+        - "model.layers.9.self_attn"
+        - "model.layers.13.self_attn"
+        - "model.layers.17.self_attn"
+        - "model.layers.21.self_attn"
+        - "model.layers.25.self_attn"
+        - "model.layers.29.self_attn"
+        - "model.layers.33.self_attn"
+        - "model.layers.37.self_attn"
+        - "model.layers.41.self_attn"
+        - "model.layers.45.self_attn"
+        - "model.layers.49.self_attn"
+        - "model.layers.53.self_attn"
+        - "model.layers.57.self_attn"
+        - "model.layers.61.self_attn"
+        - "model.layers.65.self_attn"
+        - "model.layers.69.self_attn"
+        - "model.layers.73.self_attn"
+        - "model.layers.77.self_attn"
+        - "model.layers.81.self_attn"
+        - "model.layers.85.self_attn"
+        - "model.layers.86.self_attn"
+        - "model.layers.87.self_attn"
+      exclude:
+        - "*sink*"
+
+  dataset: qwen3_cot_w4a4.json
+
+  save:
+    - type: "ascendv1_saver"
+      part_file_size: 4

@@ -72,3 +72,57 @@ SWA 层没有 `v_cache_scale` 参数；若 checkpoint 带上 SWA 层的 `fa_v.sc
   （仅 embed_tokens / lm_head / model.norm 为 F32 而非 BF16，符合
   `enable_lm_head_fp32: true`）
 - TP8 起服加载 38.94 GB/rank，vLLM 正确识别 MXFP8 KV recipe，正常生成
+
+---
+
+# 精度调优配方变体（2026-11-08）
+
+按《量化精度调优指南》步骤 3「量化算法选择」准备的 W4A4C8 变体。
+基线是 `iquest_q1_w4a4c8_mxfp4.yaml`（attention W8A8 + 专家 W4A4，全 minmax）。
+
+| 变体 | attention W8A8 权重 | 专家 W4A4 权重 | 状态 |
+|---|---|---|---|
+| `iquest_q1_w4a4c8_mxfp4_tune_b1.yaml` | `mse_round` | `ceil_x`（关 search） | **不可用**：`mse_round` 触发上游 bug（见下） |
+| `iquest_q1_w4a4c8_mxfp4_tune_b2b.yaml` | minmax | `ceil_x`（关 search） | 可执行 |
+| `iquest_q1_w4a4c8_mxfp4_tune_b3.yaml` | `mse_round` | minmax | **不可用**：同上 |
+
+## 为什么关掉 ceil_x 的 enable_search
+
+官方参考配方（`gemma4_moe_mxfp8_mxfp4.yaml`）用 `enable_search: true`，
+但 `ceil_x_search_best`（`core/quantizer/impl/ceil_x.py:107`）是对**整个权重张量**
+做 25 个候选值的完整 quantize + dequantize + MSE 比较。IQuest 的专家权重是
+**3D 融合张量** `[256, 2I, H]` → 计算量放大 256 倍，实测 30 分钟卡死在 layer 0。
+
+改用固定 `ceil_x_value: 7.25`（`enable_search: false`）即可，
+**在 IQuest 上不要开 search**。
+
+## mse_round 暂不可用（上游 bug）
+
+`mse_round` 在 IQuest 上直接崩：
+
+```
+RuntimeError: The size of tensor a (1024) must match the size of tensor b (96)
+  at non-singleton dimension 1
+  File ".../core/quantizer/impl/mse_round.py", line 94, in forward
+  File ".../ir/api/impl/mx_quantization.py", line 112, in mxfp_per_block_dequantize
+```
+
+根因（不是配方写错）：`MXWeightPerBlockMseRound.init_weight` 把量化后的 storage
+**还原成原形状**，但 `w_q_param.ext['scale']` 仍是**块形状**，`forward()` 用这两个
+形状不匹配的量做反量化 → 广播失败。
+对照 `MXWeightPerBlockMinmax`：它保留两份 storage（块形状用于 forward 反量化、
+原形状用于 deploy），因此没有问题。
+
+修复方案见工作区 `quant/kv_c8/patch_mse_round_blockshape.md`（待应用/上报上游）。
+修好后 B-1/B-3 才可用。
+
+## MX 格式下真正可选的量化方法（查 `core/quantizer/impl/` 注册表）
+
+| dtype / scope | 可用 method |
+|---|---|
+| `mxfp8_per_block_sym` | `minmax`, `mse_round`（后者当前不可用） |
+| `mxfp4_per_block_sym` | `minmax`, `ceil_x`, `fouroversix` |
+
+INT8 常见的 `ssz` / `gptq` / `autoround` 在 MX 格式下**没有实现**。
+激活侧同理：MX 的 act 是 data-free 运行时量化，`method` 只作用于权重。
+
