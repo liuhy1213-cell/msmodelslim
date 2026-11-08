@@ -80,11 +80,17 @@ SWA 层没有 `v_cache_scale` 参数；若 checkpoint 带上 SWA 层的 `fa_v.sc
 按《量化精度调优指南》步骤 3「量化算法选择」准备的 W4A4C8 变体。
 基线是 `iquest_q1_w4a4c8_mxfp4.yaml`（attention W8A8 + 专家 W4A4，全 minmax）。
 
-| 变体 | attention W8A8 权重 | 专家 W4A4 权重 | 状态 |
+| 变体 | attention W8A8 权重 | 专家 W4A4 权重 | GSM8K-200 实测（max_tokens=3072） |
 |---|---|---|---|
-| `iquest_q1_w4a4c8_mxfp4_tune_b1.yaml` | `mse_round` | `ceil_x`（关 search） | **不可用**：`mse_round` 触发上游 bug（见下） |
-| `iquest_q1_w4a4c8_mxfp4_tune_b2b.yaml` | minmax | `ceil_x`（关 search） | 可执行 |
-| `iquest_q1_w4a4c8_mxfp4_tune_b3.yaml` | `mse_round` | minmax | **不可用**：同上 |
+| 基线 `iquest_q1_w4a4c8_mxfp4.yaml` | minmax | minmax | 194/200（97.0%，截断 7） |
+| `iquest_q1_w4a4c8_mxfp4_tune_b1.yaml` | `mse_round` | `ceil_x`（关 search） | **197/200（98.5%，截断 2）= BF16 持平 ★ 采纳** |
+| `iquest_q1_w4a4c8_mxfp4_tune_b2b.yaml` | minmax | `ceil_x`（关 search） | 194/200（97.0%，截断 3） |
+| `iquest_q1_w4a4c8_mxfp4_tune_b3.yaml` | `mse_round` | minmax | 193/200（96.5%，截断 6） |
+| BF16 上界 | — | — | 197/200（98.5%，截断 4） |
+
+**单独换 method 都不动总分，组合（B-1）才拉平 BF16**——两个权重舍入改进的收益
+在联合分布上才显影。B-1 vs BF16 真数值回归 0 题（变错 2 题全是截断）。
+产物：`/mnt/sfs_turbo/models/IQuest-Q1-W4A4C8-tuneB1`。
 
 ## 为什么关掉 ceil_x 的 enable_search
 
