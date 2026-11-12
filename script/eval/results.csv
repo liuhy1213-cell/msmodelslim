@@ -1,0 +1,5 @@
+run,label,model,prompt_level_strict,inst_level_strict,prompt_level_loose,inst_level_loose,truncated,avg_out_tokens
+20261112_013832,v1,IQuest-Q1,74.33,75.87,77.67,78.78,22,5386
+reference_qping,c8_official_w8a8c8,batch32,69.67,71.22,73.33,74.42,26,?
+20261112_014145,bf16,q1-bf16,71.33,72.09,74.33,74.71,30,5595
+20261112_022154,c8,IQuest-Q1,72.67,73.84,76.00,76.74,24,5473

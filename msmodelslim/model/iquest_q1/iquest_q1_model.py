@@ -264,10 +264,11 @@ class IQuestQ1CalibMoE(nn.Module):
 
     def _apply(self, fn, recurse=True):
         ret = super()._apply(fn, recurse)
-        # Track the fused weights with the module's device residency.  When
-        # the module is moved off a compute device (cpu/meta offload after the
-        # layer step) the fused copies are dropped; they are re-materialized
-        # on the next NPU residency by the adapter's load path.
+        # Track the fused weights with the module's device residency.  They are
+        # only dropped when the module is offloaded to meta (parameter-less
+        # shell); a plain ``.to(cpu)`` from LoadProcessor must keep them, since
+        # the calibration forward (fa3_quant) runs *after* that load step and
+        # reads ``_gate3/_up3/_down3`` instead of the per-expert Linear modules.
         for name in ("_gate3", "_up3", "_down3"):
             tensor = self.__dict__.get(name)
             if isinstance(tensor, torch.Tensor):
@@ -275,7 +276,7 @@ class IQuestQ1CalibMoE(nn.Module):
                     moved = fn(tensor)
                 except Exception:
                     moved = None
-                if moved is None or moved.device.type in ("meta", "cpu"):
+                if moved is None or moved.device.type == "meta":
                     self.__dict__.pop(name, None)
                 else:
                     self.__dict__[name] = moved
@@ -288,7 +289,9 @@ class IQuestQ1CalibMoE(nn.Module):
         device = x.device
 
         # fp32 router (moe_router_dtype=float32), softmax + top-k renormalize.
-        logits = F.linear(x, self.router.weight.to(torch.float32))
+        # moe_router_dtype=float32: both operands must be fp32 (the residual
+        # stream is bf16 and the router weight stays unquantized bf16).
+        logits = F.linear(x.to(torch.float32), self.router.weight.to(torch.float32))
         probs = torch.softmax(logits, dim=-1)
         top_w, top_e = torch.topk(probs, self.top_k, dim=-1)
         top_w = top_w / top_w.sum(dim=-1, keepdim=True)
@@ -303,19 +306,32 @@ class IQuestQ1CalibMoE(nn.Module):
                 "the layer must be loaded through the adapter's on-demand path."
             )
 
-        # All-experts batched compute: [E, I, H] @ [H, T] -> [E, I, T].
-        xt = x.t().to(gate3.dtype)
-        gate_out = torch.matmul(gate3, xt)  # [E, I, T]
-        up_out = torch.matmul(up3, xt)      # [E, I, T]
-        # down 投影要求 [E, T, I] @ [E, I, H]，故把 act 从 [E, I, T] 转回 [E, T, I]
-        act = (F.silu(gate_out) * up_out).transpose(1, 2)  # [E, T, I]
-        expert_out = torch.matmul(act, down3.transpose(1, 2))  # [E, T, H]
+        # Top-k dispatch instead of a dense all-expert pass.  Mathematically
+        # identical (unselected experts contribute zero weight), but 256/top_k
+        # times cheaper -- the dense version cost ~78 min per CPU layer, which
+        # made an 87-layer calibration run infeasible.
+        flat_e = top_e.reshape(-1)                                # [T*K]
+        flat_w = top_w.reshape(-1).to(torch.float32)              # [T*K]
+        flat_tok = torch.arange(num_tokens, device=device).repeat_interleave(self.top_k)
+        order = torch.argsort(flat_e, stable=True)
+        sorted_e = flat_e[order]
+        sorted_tok = flat_tok[order]
+        sorted_w = flat_w[order]
+        counts = torch.bincount(sorted_e, minlength=self.num_experts)
 
-        tok = torch.arange(num_tokens, device=device)
         final = torch.zeros(num_tokens, self.hidden_size, dtype=torch.float32, device=device)
-        for i in range(self.top_k):
-            sel = expert_out[top_e[:, i], tok].float()  # [T, H]
-            final += sel * top_w[:, i].to(torch.float32).unsqueeze(-1)
+        start = 0
+        for e in range(self.num_experts):
+            n = int(counts[e].item())
+            if n == 0:
+                start += n
+                continue
+            idx = sorted_tok[start:start + n]
+            rows = x[idx].to(gate3.dtype)                              # [n, H]
+            act = F.silu(rows @ gate3[e].t()) * (rows @ up3[e].t())    # [n, I]
+            expert_out = act @ down3[e].t()                            # [n, H]
+            final.index_add_(0, idx, expert_out.float() * sorted_w[start:start + n].unsqueeze(-1))
+            start += n
         return final.to(x.dtype).view(orig_shape)
 
 

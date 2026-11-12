@@ -34,6 +34,7 @@ from transformers import AutoTokenizer  # pylint: disable=no-name-in-module
 
 from msmodelslim.core.base.protocol import ProcessRequest
 from msmodelslim.core.const import DeviceType
+from msmodelslim.core.quant_service.modelslim_v1.save.interface import AscendV1SaveTransformInterface
 from msmodelslim.model.common.vlm_base import VLMBaseModelAdapter
 from msmodelslim.model.interface_hub import (
     ModelInfoInterface,
@@ -45,6 +46,7 @@ from msmodelslim.utils.exception import InvalidModelError
 from msmodelslim.utils.logging import logger_setter, get_logger
 from msmodelslim.utils.security import get_valid_read_path, json_safe_load, MAX_READ_FILE_SIZE_512G
 
+from .expert_fusion import ExpertFuser
 from .iquest_q1_model import (
     IQuestQ1CalibAttention,
     IQuestQ1CalibDecoderLayer,
@@ -72,6 +74,7 @@ class IQuestQ1ModelAdapter(
     ModelInfoInterface,
     ModelSlimPipelineInterfaceV1,
     FA3QuantAdapterInterface,
+    AscendV1SaveTransformInterface,
 ):
     """Layer-wise modelslim_v1 adapter for IQuest-Q1.
 
@@ -82,6 +85,8 @@ class IQuestQ1ModelAdapter(
       expected quantized-key layout (incl. ``mlp.experts.fc.<eid>.*``).
     - MoE calibration runs all experts with stacked einsums over the fused
       checkpoint tensors captured at layer load time.
+    - 保存阶段把逐专家张量融合成 vLLM-ascend 的 ``routed_experts`` 布局
+      （见 ``expert_fusion.ExpertFuser``），保证一条命令直接产出可部署权重。
     """
 
     def __init__(self, model_type: str, model_path: Path, trust_remote_code: bool = False):
@@ -89,6 +94,7 @@ class IQuestQ1ModelAdapter(
         self._tokenizer = AutoTokenizer.from_pretrained(  # nosec B615
             str(self.model_path), trust_remote_code=self.trust_remote_code, local_files_only=True
         )
+        self._expert_fuser = ExpertFuser(self.config.num_experts)
         get_logger().info("IQuest-Q1 adapter ready (tokenizer=%s)", type(self._tokenizer).__name__)
 
     # ===== ModelInfoInterface =====
@@ -270,7 +276,11 @@ class IQuestQ1ModelAdapter(
         get_logger().info("Initializing IQuest-Q1 calibration shell (layer-wise)...")
         self.model_path = Path(get_valid_read_path(str(self.model_path), is_dir=True, check_user_stat=True))
 
-        model = IQuestQ1CalibModel(self.config)
+        # Shell must be bf16: load_state_dict copies (does not retype) tensors,
+        # so modules built in the default float32 would keep float32 params and
+        # feed float32 activations into bf16 quantized linears during calibration.
+        with default_dtype(torch.bfloat16):
+            model = IQuestQ1CalibModel(self.config)
 
         root_keys = ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]
         tensors = self._read_checkpoint_tensors(root_keys, "Loading shell weights")
@@ -284,13 +294,34 @@ class IQuestQ1ModelAdapter(
             },
             strict=True,
         )
+        model = model.to(torch.bfloat16)
+        embed_dtype = model.embed_tokens.weight.dtype
+        if embed_dtype != torch.bfloat16:
+            raise InvalidModelError(
+                f"Calibration shell must be bf16, got embed_tokens dtype {embed_dtype}.",
+                action="Please keep init_model dtype aligned with get_global_model_torch_dtype.",
+            )
         model.eval()
-        get_logger().info("Shell model ready (layers appended on demand)")
+        get_logger().info(
+            "Shell model ready (layers appended on demand, dtype=%s)", embed_dtype
+        )
         return model
+
+    def _visit_limit(self) -> int:
+        """Number of decoder layers to visit.
+
+        The full pipeline always visits every layer.  ``IQUEST_MAX_LAYERS`` is a
+        development knob for incremental quantization experiments (smoke tests
+        on the first layers); it must stay unset for real runs.
+        """
+        max_layers = int(os.environ.get("IQUEST_MAX_LAYERS", "0") or "0")
+        if max_layers <= 0:
+            return self.config.num_hidden_layers
+        return min(max_layers, self.config.num_hidden_layers)
 
     def generate_model_visit(self, model: nn.Module) -> Generator[ProcessRequest, Any, None]:
         """Visit pipeline: decoder layers in order (on-demand load)."""
-        for idx in range(self.config.num_hidden_layers):
+        for idx in range(self._visit_limit()):
             layer = self._ensure_layer(model, idx)
             yield ProcessRequest(f"model.layers.{idx}", layer, tuple(), {})
 
@@ -304,7 +335,7 @@ class IQuestQ1ModelAdapter(
         input_ids = sample["input_ids"]
 
         hidden_states = model.embed_tokens(input_ids)
-        for idx in range(self.config.num_hidden_layers):
+        for idx in range(self._visit_limit()):
             layer = self._ensure_layer(model, idx)
             hidden_states = yield ProcessRequest(
                 f"model.layers.{idx}", layer, (hidden_states,), {}
@@ -337,3 +368,21 @@ class IQuestQ1ModelAdapter(
             root_module.set_submodule(f"{prefix}fa_k", FA3QuantPlaceHolder(ratio=1.0))
             root_module.set_submodule(f"{prefix}fa_v", FA3QuantPlaceHolder(ratio=1.0))
             get_logger().info("Injected FA3 placeholders into %s", full_name)
+
+    # ===== AscendV1SaveTransformInterface =====
+
+    def ascendv1_transform_save_entry(
+        self, prefix: str, desc: str, tensor: torch.Tensor, write_tensor: Callable, write_desc: Callable
+    ) -> bool:
+        """逐专家张量先缓存，等整层到齐后按 ``routed_experts`` 布局融合写出。"""
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        if world_size > 1:
+            raise InvalidModelError(
+                "IQuest-Q1 的 routed_experts 融合要求同一进程内看到全部专家，"
+                f"当前为分布式保存（world_size={world_size}），无法保证权重完整。",
+                action="请使用单进程 layer-wise 保存（runner 不要开启 DP/EP 分布）。",
+            )
+        return self._expert_fuser.consume(prefix, desc, tensor, write_tensor, write_desc)
+
+    def ascendv1_flush_save_entries(self, write_tensor: Callable, write_desc: Callable) -> None:
+        self._expert_fuser.flush(write_tensor, write_desc)
