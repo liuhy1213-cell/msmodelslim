@@ -1,0 +1,102 @@
+# IQuest-Q1 W8A8C8 (MXFP8) 量化配方
+#
+# 结构参照 msmodelslim/lab_practice/qwen3_5_moe/qwen3_6_35b_a3b_w8a8c8_mxfp8.yaml
+# （同为 MoE + per-block MXFP8 权重 + fa3 per-channel V 的 C8 路线），
+# 并对齐 vllm-ascend 的 AscendC8MXFPKVCacheAttentionMethod 期望的 checkpoint 格式：
+#   - fa_v.scale : uint8[1024]，E8M0 字节（8 kv heads x 128 head_dim）
+#   - 每层 self_attn.quant_type : QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL
+#
+# 只对 25 个 full-attention 层做 KV C8：其余 63 个 sliding-window 层没有
+# v_cache_scale 参数（vllm-ascend _is_full_attention_layer 不给 SWA 层挂 C8 method），
+# 若 checkpoint 里带它们的 fa_v.scale 会在加载时 KeyError / 多余参数报错。
+apiversion: modelslim_v1
+
+metadata:
+  config_id: iquest_q1_w8a8c8_mxfp8
+  score: 90
+  verified_model_types:
+    - IQuest-Q1
+  label:
+    w_bit: 8
+    a_bit: 8
+    is_sparse: False
+    kv_cache: True
+
+default_w8a8_dynamic: &mxfp8_w8a8
+  act:
+    scope: "per_block"
+    dtype: "mxfp8"
+    symmetric: True
+    method: "minmax"
+  weight:
+    scope: "per_block"
+    dtype: "mxfp8"
+    symmetric: True
+    method: "minmax"
+
+spec:
+  process:
+    # 权重/激活：attention + MoE 逐专家 + layer0 稠密 MLP
+    - type: "linear_quant"
+      qconfig: *mxfp8_w8a8
+      include:
+        - "*self_attn*"
+        - "*mlp.experts*"
+        - "model.layers.0.mlp.gate_proj"
+        - "model.layers.0.mlp.up_proj"
+        - "model.layers.0.mlp.down_proj"
+      exclude:
+        - "*sink*"
+
+    # KV cache C8：Q/K 动态 per-block，V 静态 per-channel（E8M0）
+    - type: "fa3_quant"
+      details:
+        fa_q:
+          dtype: "mxfp8"
+          scope: "per_block"
+          symmetric: True
+          method: "minmax"
+        fa_k:
+          dtype: "mxfp8"
+          scope: "per_block"
+          symmetric: True
+          method: "minmax"
+        fa_v:
+          dtype: "mxfp8"
+          scope: "per_channel"
+          symmetric: True
+          method: "minmax"
+      include:
+        - "model.layers.0.self_attn"
+        - "model.layers.1.self_attn"
+        - "model.layers.5.self_attn"
+        - "model.layers.9.self_attn"
+        - "model.layers.13.self_attn"
+        - "model.layers.17.self_attn"
+        - "model.layers.21.self_attn"
+        - "model.layers.25.self_attn"
+        - "model.layers.29.self_attn"
+        - "model.layers.33.self_attn"
+        - "model.layers.37.self_attn"
+        - "model.layers.41.self_attn"
+        - "model.layers.45.self_attn"
+        - "model.layers.49.self_attn"
+        - "model.layers.53.self_attn"
+        - "model.layers.57.self_attn"
+        - "model.layers.61.self_attn"
+        - "model.layers.65.self_attn"
+        - "model.layers.69.self_attn"
+        - "model.layers.73.self_attn"
+        - "model.layers.77.self_attn"
+        - "model.layers.81.self_attn"
+        - "model.layers.85.self_attn"
+        - "model.layers.86.self_attn"
+        - "model.layers.87.self_attn"
+      exclude:
+        - "*sink*"
+
+  dataset: mix_calib.jsonl
+
+  save:
+    - type: "ascendv1_saver"
+      part_file_size: 4

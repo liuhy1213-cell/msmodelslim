@@ -1,0 +1,139 @@
+# IQuest-Q1 W4A4C8 (MXFP4) 精度调优变体 B-2b
+#
+# 与 B-2 的唯一差异：ceil_x 的 enable_search 关闭。
+# 原因：ceil_x_search_best 对整个权重张量做 25 个候选值的完整 quantize+dequantize+MSE，
+# IQuest 的专家权重是 3D 融合张量 [256, 2I, H] → 计算量放大 256 倍，
+# 实测 30 分钟卡在 layer 0 无法完成。改用固定 ceil_x_value=7.25。
+#
+# 仅把「专家 W4A4 权重」从 minmax 改为 ceil_x(enable_search)，
+# attention W8A8 权重保持 minmax —— 用于隔离 ceil_x 的单独贡献。
+#
+# 结构参照 lab_practice/glm_5_2/glm_5_3_w4a4c8_mxfp4.yaml：
+#   - attention（q/k/v/o）与 layer0 稠密 MLP 保持 W8A8 mxfp8
+#     （GLM-5.3 / GLM-5.1 官方 W4A4C8 配方均为「attention W8A8 + 专家 W4A4」策略）
+#   - MoE 逐专家 W4A4 mxfp4（per_block 32, minmax）
+#   - KV C8 与 iquest_q1_w8a8c8_mxfp8.yaml 完全一致：
+#     fa_q/fa_k per_block 动态、fa_v per_channel 静态（E8M0），仅 25 个 full-attention 层
+#
+# 注意：GLM-5.3 的配方另含 quarot + flex_smooth_quant 预处理；这两个 processor 要求
+# 模型适配器实现 QuaRotInterface / FlexSmoothQuantInterface（离线旋转映射、norm 融合
+# 映射，参考 qwen3_5_moe 适配器约 300 行的实现），IQuest 适配器尚未实现。
+# 故本配方采用 glm_5_1_w4a4c8_mxfp4.yaml 同形的无预处理路线（该官方配方已在
+# Ascend_950 / Atlas_350 双场景验证，score 86）。若后续精度不达标，再补旋转预处理。
+apiversion: modelslim_v1
+
+metadata:
+  config_id: iquest_q1_w4a4c8_mxfp4_tune_b2b
+  score: 90
+  verified_tags:
+    IQuest-Q1:
+      - - vLLM-Ascend
+        - Atlas_350
+  label:
+    w_bit: 4
+    a_bit: 4
+    is_sparse: False
+    kv_cache: True
+
+default_w8a8_mxfp_dynamic: &default_w8a8_mxfp_dynamic
+  act:
+    scope: "per_block"
+    dtype: "mxfp8"
+    symmetric: True
+    method: "minmax"
+  weight:
+    scope: "per_block"
+    dtype: "mxfp8"
+    symmetric: True
+    method: "minmax"
+
+default_w4a4_mxfp_dynamic: &default_w4a4_mxfp_dynamic
+  act:
+    scope: "per_block"
+    dtype: "mxfp4"
+    symmetric: True
+    method: "minmax"
+  weight:
+    scope: "per_block"
+    dtype: "mxfp4"
+    symmetric: True
+    method: "ceil_x"
+    ext:
+      axes: -1
+      ceil_x_value: 7.25
+      enable_search: false
+      search_min: 6.0
+      search_max: 12.0
+      search_step: 0.25
+
+spec:
+  process:
+    # 权重/激活 W8A8：attention + layer0 稠密 MLP（与 GLM-5.3 W4A4C8 策略一致）
+    - type: "linear_quant"
+      qconfig: *default_w8a8_mxfp_dynamic
+      include:
+        - "*self_attn*"
+        - "model.layers.0.mlp.gate_proj"
+        - "model.layers.0.mlp.up_proj"
+        - "model.layers.0.mlp.down_proj"
+      exclude:
+        - "*sink*"
+
+    # MoE 逐专家 W4A4
+    - type: "linear_quant"
+      qconfig: *default_w4a4_mxfp_dynamic
+      include:
+        - "*mlp.experts*"
+
+    # KV cache C8：与 W8A8C8 配方一致
+    - type: "fa3_quant"
+      details:
+        fa_q:
+          dtype: "mxfp8"
+          scope: "per_block"
+          symmetric: True
+          method: "minmax"
+        fa_k:
+          dtype: "mxfp8"
+          scope: "per_block"
+          symmetric: True
+          method: "minmax"
+        fa_v:
+          dtype: "mxfp8"
+          scope: "per_channel"
+          symmetric: True
+          method: "minmax"
+      include:
+        - "model.layers.0.self_attn"
+        - "model.layers.1.self_attn"
+        - "model.layers.5.self_attn"
+        - "model.layers.9.self_attn"
+        - "model.layers.13.self_attn"
+        - "model.layers.17.self_attn"
+        - "model.layers.21.self_attn"
+        - "model.layers.25.self_attn"
+        - "model.layers.29.self_attn"
+        - "model.layers.33.self_attn"
+        - "model.layers.37.self_attn"
+        - "model.layers.41.self_attn"
+        - "model.layers.45.self_attn"
+        - "model.layers.49.self_attn"
+        - "model.layers.53.self_attn"
+        - "model.layers.57.self_attn"
+        - "model.layers.61.self_attn"
+        - "model.layers.65.self_attn"
+        - "model.layers.69.self_attn"
+        - "model.layers.73.self_attn"
+        - "model.layers.77.self_attn"
+        - "model.layers.81.self_attn"
+        - "model.layers.85.self_attn"
+        - "model.layers.86.self_attn"
+        - "model.layers.87.self_attn"
+      exclude:
+        - "*sink*"
+
+  dataset: qwen3_cot_w4a4.json
+
+  save:
+    - type: "ascendv1_saver"
+      part_file_size: 4

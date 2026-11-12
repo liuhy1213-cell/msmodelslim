@@ -271,6 +271,9 @@ class DistributedAscendV1Saver(AscendV1Saver):
             {scope: scope_info.model_dump(mode='json') for scope, scope_info in self.json_optional_infos.items()},
         )
 
+        if self._save_transform is not None:
+            self._save_transform.ascendv1_flush_save_entries(self.write_tensor_now, self.write_desc)
+
         self.json_writer.close()
         self.safetensors_writer.close()
 

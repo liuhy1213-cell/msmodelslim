@@ -39,7 +39,7 @@ from msmodelslim.utils.logging import logger_setter
 from msmodelslim.utils.security import safe_copy_file, get_write_directory
 from msmodelslim.utils.security import json_safe_load, json_safe_dump
 from msmodelslim.utils.validation.pydantic import in_range
-from .interface import AscendV1SaveInterface, AscendV1GlobalModelDtypeInterface
+from .interface import AscendV1SaveInterface, AscendV1GlobalModelDtypeInterface, AscendV1SaveTransformInterface
 from .saver import AutoSaverProcessor, AutoSaverBaseConfig, _convert_hookir_to_wrapper
 from .utils.deqscale import deqscale2int64_by_dtype
 from .utils.json import JsonWriter
@@ -203,6 +203,8 @@ class AscendV1Saver(AutoSaverProcessor):
         self._global_torch_dtype_is_bf16 = self._resolve_is_bf16_from_adapter(adapter)
         self.desc_quant: str = ''
         self._desc_transform = None
+        # 可选的适配器扩展点：可在张量落盘前接管并改写（如逐专家权重融合）。
+        self._save_transform = adapter if isinstance(adapter, AscendV1SaveTransformInterface) else None
 
     def support_distributed(self) -> bool:
         return True
@@ -231,6 +233,9 @@ class AscendV1Saver(AutoSaverProcessor):
             "optional",
             {scope: scope_info.model_dump(mode='json') for scope, scope_info in self.json_optional_infos.items()},
         )
+
+        if self._save_transform is not None:
+            self._save_transform.ascendv1_flush_save_entries(self.write_tensor_now, self.write_desc)
 
         self.json_writer.close()
         self.safetensors_writer.close()
@@ -281,10 +286,24 @@ class AscendV1Saver(AutoSaverProcessor):
         return False
 
     def write_tensor(self, prefix: str, desc: str, tensor: torch.Tensor):
+        if self._save_transform is not None and self._save_transform.ascendv1_transform_save_entry(
+            prefix, desc, tensor, self.write_tensor_now, self.write_desc
+        ):
+            return
+        self.write_tensor_now(prefix, desc, tensor)
+
+    def write_tensor_now(self, prefix: str, desc: str, tensor: torch.Tensor):
+        """实际落盘一个张量及其描述；``write_tensor`` 的适配器扩展点也会走这里。"""
         if self._desc_transform is not None:
             desc = self._desc_transform(desc)
         self.json_writer.write(prefix, desc)
         self.safetensors_writer.write(prefix, tensor)
+
+    def write_desc(self, prefix: str, desc: str):
+        """只写描述不写张量（用于 vLLM 读取的别名键）。"""
+        if self._desc_transform is not None:
+            desc = self._desc_transform(desc)
+        self.json_writer.write(prefix, desc)
 
     def on_w8a8_static(self, prefix: str, module: qir.W8A8StaticFakeQuantLinear):
         self.update_quant_type("W8A8")

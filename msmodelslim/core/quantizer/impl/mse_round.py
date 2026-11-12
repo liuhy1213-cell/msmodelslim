@@ -55,7 +55,14 @@ class MXWeightPerBlockMseRound(AutoWeightQuantizer):
             raise SchemaValidateError(f"Invalid value for 'axes': {self.axes}. Expected int or list[int].")
         self.block_size = config.dtype.mx_finfo.block_size
         self.w_q_param: Optional[QParam] = None
+        # w_q_storage 保持 block 形状（forward 反量化用）；
+        # w_q_storage_orig 为还原后的原始形状（deploy 用）。
+        # 两者混用会导致 scale（block 形状）与权重（原形状）广播失败。
         self.w_q_storage: Optional[QStorage] = None
+        self.w_q_storage_orig: Optional[QStorage] = None
+        self._orig_shape = None
+        self._padded_shape = None
+        self._axes = None
 
     def _build_qparam(self, shared_exp: torch.Tensor) -> QParam:
         mx_finfo = QDType(self.config.dtype).mx_finfo
@@ -91,7 +98,10 @@ class MXWeightPerBlockMseRound(AutoWeightQuantizer):
     def forward(self, x: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.w_q_storage is None or self.w_q_param is None:
             raise SpecError("No quantized weight was set", action="please call init_weight first")
+        # w_q_storage 是 block 形状，w_q_param.ext['scale'] 同为 block 形状，
+        # 两者可直接广播；反量化后再还原成原始形状。
         dequant_value = dequantize(self.w_q_storage, self.w_q_param).value
+        dequant_value = undo_reshape_to_blocks(dequant_value, self._padded_shape, self._orig_shape, self._axes)
         return dequant_value
 
     @validate_call(config=dict(arbitrary_types_allowed=True))
@@ -133,13 +143,20 @@ class MXWeightPerBlockMseRound(AutoWeightQuantizer):
 
         self.w_q_param = self._build_qparam(shared_exp)
         self.w_q_param.ext["axes"] = self.axes
+        self._axes = axes
+        self._orig_shape = orig_shape
+        self._padded_shape = padded_shape
+        # 保持 block 形状供 forward() 反量化（scale 也是 block 形状）
         self.w_q_storage = quantize(float_storage, self.w_q_param)
-        self.w_q_storage.value = undo_reshape_to_blocks(self.w_q_storage.value, padded_shape, orig_shape, axes)
+        # 另存一份还原后的原始形状供 deploy() 使用
+        w_q_storage_orig_value = undo_reshape_to_blocks(
+            self.w_q_storage.value.clone(), padded_shape, orig_shape, axes)
+        self.w_q_storage_orig = QStorage(self.w_q_storage.dtype, w_q_storage_orig_value)
 
     def get_q_storage(self) -> QStorage:
-        if self.w_q_storage is None:
+        if self.w_q_storage_orig is None:
             raise SpecError("No quantized weight was set", action="please call init_weight first")
-        return self.w_q_storage
+        return self.w_q_storage_orig
 
     def get_q_param(self) -> QParam:
         if self.w_q_param is None:
