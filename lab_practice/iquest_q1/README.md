@@ -30,7 +30,7 @@ msmodelslim quant \
 | 权重/激活 | mxfp8 / per_block / minmax | attention + MoE 逐专家 + layer0 稠密 MLP；`*sink*` 排除 |
 | KV C8 | `fa3_quant` details 分支 | fa_q / fa_k = per_block **动态**；fa_v = per_channel **静态**（E8M0 scale） |
 | KV 层集合 | 仅 25 个 full-attention 层 | SWA 层保持 bf16 KV，见下文「SWA 层」 |
-| 标定集 | `mix_calib.jsonl` | 相对名由 `FileDatasetLoader` 解析到 `lab_calib/` |
+| 标定集 | `qwen3_cot_w4a4.json` | 42 条、1243~2661 token、合计 91k；相对名由 `FileDatasetLoader` 解析到 `lab_calib/`。旧的 `mix_calib.jsonl` 只有 48 条 / 中位 334 token，偏短 |
 | save | `ascendv1_saver`, `part_file_size: 4` | 该字段按 **GB** 解释，4 → 每 4 GB 一个分片 |
 
 ## 适配器结构（`msmodelslim/model/iquest_q1/`）
@@ -39,8 +39,8 @@ msmodelslim quant \
 |---|---|
 | `configuration_iquest_q1.py` | `IQuestQ1Config`，注册进 transformers `AutoConfig`（`loader.py` import 时注册） |
 | `loader.py` | `IQuestQ1AdapterLoader` 入口，`config.ini` 的 `[ModelAdapterEntryPoints]` 指向此处 |
-| `model_adapter.py` | 标定数据加载（兼容 `text` / `prompt` / `inputs_pretokenized` 键名）、逐层加载与送 quant processor |
-| `iquest_q1_model.py` | 标定用前向图：ForCausalLM 形态（`model.*` + `lm_head`）、稠密层 / MoE 层实现 |
+| `model_adapter.py` | 标定数据加载（兼容 `text` / `prompt` / `inputs_pretokenized` 键名）、逐层加载与送 quant processor；结构照 deepseek_v4 适配器：`init_model` 只建 1 层壳，`generate_decoder_layer` 按需建层，`generate_model_forward` 用 layer0 pre-hook 截住 `(positions, hidden_states)` 后逐层 yield |
+| `iquest_q1_model.py` | 标定前向图，与上游 `vllm_iquest_q1/model.py` 逐行对齐：causal + 逐层 sliding_window（含当前 token）+ sink 列、sandwich norm（layer0 额外 `ffn_out_norm`）、per-layer rope theta |
 
 ## 产出与 vllm-ascend 对接的注意事项
 
@@ -132,3 +132,60 @@ RuntimeError: The size of tensor a (1024) must match the size of tensor b (96)
 INT8 常见的 `ssz` / `gptq` / `autoround` 在 MX 格式下**没有实现**。
 激活侧同理：MX 的 act 是 data-free 运行时量化，`method` 只作用于权重。
 
+---
+
+# 适配器 v2（2026-11-16）
+
+## 改了什么
+
+初版适配器的标定前向是**手写的 `embed -> layers -> norm`**，两个硬伤：
+
+1. **没有 causal / sliding_window 掩码**——整条序列双向注意力，滑窗层更是全可见；
+2. **层类型按 `last_layers_types` 从尾部反向索引**，与上游
+   `get_layer_sliding_window_size` 的 first→block→last 公式不一致。
+
+v2 直接复用模型自己的 forward：`init_model` 只建 1 层壳，layer0 上挂 pre-hook 截住
+`(positions, hidden_states)`，然后逐层 yield 给 quant processor。逐层语义逐行照抄上游：
+88 层 = 25 full（0, 1, 5, 9, …, 81, 85, 86, 87）+ 63 sliding，25 个 full 层进 `fa3_quant`。
+
+自检（不需要权重）：
+
+```bash
+IQUEST_MODEL_DIR=/path/to/IQuest-Q1 python script/quantize/iquest_q1_selftest.py
+```
+
+按扰动传播范围验证掩码（window=2 只有 0/1 行受影响，full 层全部行受影响，
+T=1 不出 NaN），并核对真实 config 的 25/63 层型与逐层 rope theta。
+
+## npu 与 cpu 两条量化路径不等价
+
+`--device npu` 比 `cpu` 快约 6 倍（约 14 s/层 vs 80 s/层），但两版产物**不是同一个包**：
+
+| 项 | 结果 |
+|---|---|
+| 权重 key 集合 | 一致 |
+| `weight_scale`（per_block minmax，data-free） | **逐字节相同**（0/1179648 不同） |
+| `fa_v.scale`（E8M0 per-channel） | 1024 通道里 6 个差 1 档 |
+| fp8 权重数值 | gate_proj 有 665283/37748736（1.76%）元素不同 |
+
+差异全部落在最后那次 fp→fp8 cast 上：**npu 是向零截断，cpu 是 round-to-nearest**
+（全部差异元素满足 `|npu| <= |cpu|`、符号相同、比值 ∈ [0.5, 0.9375]），
+所以 npu 包每个元素系统性偏小最多一个量化步。scale 一致说明 minmax 那步没问题。
+
+要复现上面这张表：
+
+```bash
+# 两条路径各跑 2 层冒烟（IQUEST_MAX_LAYERS=2），再逐 tensor 比
+python script/quantize/compare_checkpoints.py out_smoke out_smoke_npu
+```
+
+## 一条命令产出成品
+
+```bash
+MODEL_PATH=/path/to/IQuest-Q1 OUT=/path/to/out DEVICE=npu \
+  ./script/quantize/iquest_q1_c8_oneshot.sh
+```
+
+量化完自动跑 `script/quantize/postfix_c8.py`：`fa_v.scale` 压成 `[1024]` 并外置到
+`c8_kv_v_scales.safetensors`、从 index/description 摘掉 `fa_v.offset`、补全局
+`kv_cache_type`、从源模型硬链接 `chat_template.jinja` 与 `mtp/`。`PKGCLEAN=0` 可跳过。
