@@ -95,7 +95,7 @@ spec:
       exclude:
         - "*sink*"
 
-  dataset: mix_calib.jsonl
+  dataset: qwen3_cot_w4a4.json
 
   save:
     - type: "ascendv1_saver"
