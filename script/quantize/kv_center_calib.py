@@ -11,8 +11,9 @@
 后者只与 query 有关），因此不改变模型语义，只让 MX 的 32 通道共享尺度不再被
 通道均值偏移撑大。
 
-只处理 full-attention 层：滑窗层默认走 BF16 KV（--kv-cache-dtype-skip-layers
-sliding_window），不参与 C8；若将来滑窗层也开 C8，把 --layers all 打开即可。
+默认给 88 层全算（--layers all）：滑窗层现在也走 C8-MXFP，同样需要 μ，
+否则运行时 C8_KV_CENTER=1 会因为找不到 <layer>-<rank>.pt 直接报错。
+--layers full 只保留 25 个全注意力层，供旧配置（滑窗层留 BF16 KV）使用。
 """
 import argparse
 import json
@@ -41,8 +42,8 @@ def main():
     ap.add_argument("--seq-len", type=int, default=2048)
     ap.add_argument("--tp", type=int, default=8)
     ap.add_argument("--device", default="npu", choices=["npu", "cpu"])
-    ap.add_argument("--layers", default="full", choices=["full", "all"],
-                    help="full=只算 full-attention 层（默认，滑窗层走 BF16 KV）；all=88 层全算")
+    ap.add_argument("--layers", default="all", choices=["full", "all"],
+                    help="all=88 层全算（默认，滑窗层也走 C8）；full=只算 25 个全注意力层")
     args = ap.parse_args()
 
     out_dir = Path(args.pkg) / "kv_center"

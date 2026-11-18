@@ -55,14 +55,18 @@ spec:
           dtype: "mxfp8"
           scope: "per_block"
           symmetric: True
+          method: "minmax"
         fa_k:
           dtype: "mxfp8"
           scope: "per_block"
           symmetric: True
+          method: "minmax"
         fa_v:
           dtype: "mxfp8"
           scope: "per_channel"
           symmetric: True
+          method: "minmax"
+
       include:
         - "model.layers.0.self_attn"
         - "model.layers.1.self_attn"
