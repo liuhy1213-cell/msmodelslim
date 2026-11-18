@@ -94,6 +94,9 @@ def main():
                 ntok += b * t
             mu = (acc / ntok).float()
             mean_abs = (acc_abs / ntok).float()
+            # 全量文件：运行时按实际 TP 自己切，换 TP/加 DP 都不用重标定。
+            torch.save(torch.stack([mu, mean_abs]), out_dir / f"{idx}.pt")
+            # 兼容旧运行时：仍然写按 TP 切好的 per-rank 文件。
             for r in range(args.tp):
                 sl = slice(r * per_rank, (r + 1) * per_rank)
                 torch.save(torch.stack([mu[sl], mean_abs[sl]]),
