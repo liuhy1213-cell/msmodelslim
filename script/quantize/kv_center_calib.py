@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """生成 K 中心化用的 μ，写进成品包的 ``<pkg>/kv_center/``。
 
-对每个 full-attention 层统计 post-rope K 在 (batch, token) 维上的逐通道均值，
-形状 ``[num_kv_heads, head_dim]``；再按 TP rank 切片，每 rank 存
+只标定 **full-attention 层**（25 个）：这些层的 K 存在明显的逐通道直流偏置，
+会把 MX 的 32 通道共享尺度撑大。滑窗层的 K 分布不同，实测给它们做中心化反而
+退化（GPQA 92.9% -> 87.5%），因此不生成、运行时也不读。
 
-    <pkg>/kv_center/{layer}-{rank}.pt = tensor([mu_rank, mean_abs_k_rank])   # [2, 1, head_dim]
+每个层写一份**不切分**的表：
 
-运行时（vllm-ascend 的 C8-MXFP attention）只读第 0 项，写 KV 前做 ``K - mu``，
-并把 sink key 同步减 mu。该变换对 softmax 是等价的（<q,k-mu> = <q,k> - <q,mu>，
-后者只与 query 有关），因此不改变模型语义，只让 MX 的 32 通道共享尺度不再被
-通道均值偏移撑大。
+    <pkg>/kv_center/{layer}.pt = tensor([mu, mean_abs_k])      # [2, num_kv_heads, head_dim]
 
-默认给 88 层全算（--layers all）：滑窗层现在也走 C8-MXFP，同样需要 μ，
-否则运行时 C8_KV_CENTER=1 会因为找不到 <layer>-<rank>.pt 直接报错。
---layers full 只保留 25 个全注意力层，供旧配置（滑窗层留 BF16 KV）使用。
+运行时按实际的 TP 布局自己切（KV 头按 TP 连续分片），所以换 TP / 加 DP 都不
+需要重新标定。运行时只读第 0 项，写 KV 前做 ``K - mu``，sink key 同步减 mu；
+该变换对 softmax 是等价的（<q,k-mu> = <q,k> - <q,mu>），不改变模型语义。
 """
 import argparse
 import json
@@ -40,10 +38,10 @@ def main():
     ap.add_argument("--data", default=f"{REPO}/lab_calib/qwen3_cot_w4a4.json")
     ap.add_argument("--samples", type=int, default=16)
     ap.add_argument("--seq-len", type=int, default=2048)
-    ap.add_argument("--tp", type=int, default=8)
+
     ap.add_argument("--device", default="npu", choices=["npu", "cpu"])
-    ap.add_argument("--layers", default="all", choices=["full", "all"],
-                    help="all=88 层全算（默认，滑窗层也走 C8）；full=只算 25 个全注意力层")
+    ap.add_argument("--layers", default="full", choices=["full", "all"],
+                    help="full=只算 25 个全注意力层（默认、生产口径）；all=88 层全算（实验用）")
     args = ap.parse_args()
 
     out_dir = Path(args.pkg) / "kv_center"
@@ -70,10 +68,7 @@ def main():
     pos = [torch.arange(i.shape[1], device=dev) for i in ids]
 
     nkv = cfg.num_key_value_heads
-    if nkv % args.tp:
-        raise SystemExit(f"kv heads {nkv} 不能被 tp {args.tp} 整除")
-    per_rank = nkv // args.tp
-    print(f"目标层 {len(target)}，kv heads {nkv}，tp {args.tp} → 每 rank {per_rank} 个 head")
+    print(f"目标层 {len(target)}，kv heads {nkv}，写不切分的整体表（运行时按 TP 自己切）")
 
     for idx in range(cfg.num_hidden_layers):
         layer = adapter.load_decoder_if_not_exist(model, idx).to(dev)
@@ -94,13 +89,8 @@ def main():
                 ntok += b * t
             mu = (acc / ntok).float()
             mean_abs = (acc_abs / ntok).float()
-            # 全量文件：运行时按实际 TP 自己切，换 TP/加 DP 都不用重标定。
+            # 只写不切分的整体表：运行时按实际 TP 自己切。
             torch.save(torch.stack([mu, mean_abs]), out_dir / f"{idx}.pt")
-            # 兼容旧运行时：仍然写按 TP 切好的 per-rank 文件。
-            for r in range(args.tp):
-                sl = slice(r * per_rank, (r + 1) * per_rank)
-                torch.save(torch.stack([mu[sl], mean_abs[sl]]),
-                           out_dir / f"{idx}-{r}.pt")
             print(f"layer {idx:>2}: mu [{float(mu.min()):.3f}, {float(mu.max()):.3f}] "
                   f"|mu| 均值 {float(mu.abs().mean()):.4f}", flush=True)
         hs = [layer(pos[j], hs[j]) for j in range(len(ids))]
@@ -109,7 +99,7 @@ def main():
         if args.device == "npu":
             torch.npu.empty_cache()
 
-    print(f"完成：{len(target)} 层 × {args.tp} rank → {out_dir}")
+    print(f"完成：{len(target)} 层 → {out_dir}")
 
 
 if __name__ == "__main__":
