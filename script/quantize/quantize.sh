@@ -6,7 +6,7 @@
 #   SKIP_POSTFIX=1        跳过 C8 包整理（调试用）
 #   SKIP_KCENTER=1        跳过 K 中心化 μ（调试用）
 #   KCENTER_SAMPLES/N     统计 μ 用的标定样本数（默认 16）
-#   KCENTER_LAYERS=full   只算 25 个 full 层（默认 all：88 层全算，SWA 层也走 C8）
+#   KCENTER_LAYERS=all    88 层全算（实验用；默认只算 25 个 full 层）
 #
 # 产物（c8）：
 #   <OUT>/quant_model_weights-*.safetensors   主权重
@@ -71,12 +71,12 @@ if [ "$MODE" = "c8" ]; then
   fi
 
   if [ "${SKIP_KCENTER:-0}" != "1" ]; then
-    say "步骤 3/3 K 中心化 μ（层=${KCENTER_LAYERS:-all}，样本=${KCENTER_SAMPLES:-16}）"
+    say "步骤 3/3 K 中心化 μ（层=${KCENTER_LAYERS:-full}，样本=${KCENTER_SAMPLES:-16}）"
     "$PY" "$REPO/script/quantize/kv_center_calib.py" \
       --pkg "$OUT" \
       --device "$DEVICE" \
       --samples "${KCENTER_SAMPLES:-16}" \
-      --layers "${KCENTER_LAYERS:-all}"
+      --layers "${KCENTER_LAYERS:-full}"
     rc=$?
     [ $rc -eq 0 ] || { say "kv_center 失败 rc=$rc"; exit $rc; }
   else
