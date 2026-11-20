@@ -47,9 +47,10 @@ bash /mnt/sfs_turbo/work/liuhaiyang/script/eval/ifbench_eval.sh \
 1. **`max_model_len` 必须 >= 16384 + 输入长度**。BF16 服务默认 28672 够用；如果为了省显存
    调到 16384，长输入会直接 400，整批数据作废。
 2. **`--max-num-seqs` 至少 64**，否则 `-b 64` 会排队，TTFT 拉长但结果不变。
-3. **KV 量化不影响本指标的口径，但影响可比性**：C8 部署必须带
-   `--kv-cache-dtype mxfp8 --kv-cache-dtype-skip-layers sliding_window`，
-   和参考跑保持同一套；滑窗层一定要 skip，63 层里有 25 层是 full attention。
+3. **KV 量化不影响本指标的口径，但影响可比性**：C8 部署带 `--kv-cache-dtype mxfp8`，
+   **不要再加 `--kv-cache-dtype-skip-layers sliding_window`**（滑窗层现在也走 C8，
+   25 个全注意力层带 `fa_v.scale`，其余 63 层用中性 V 尺度）。同一组对比必须用同一套
+   KV 配置，否则分数不可比。
 4. **NLTK 离线**：容器里必须能读到 `NLTK_DATA=/mnt/sfs_turbo/work/liuhaiyang/nltk_data`
    （`corpora/ wordnet`、`tokenizers/ punkt` 等），否则 IFBench 的约束校验直接报错。
 5. **HF 离线**：`HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1`，数据集走 `local_path`，

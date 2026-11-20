@@ -12,6 +12,8 @@ import json
 import os
 import sys
 
+import torch
+
 FULL_ATTN_LAYERS = [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49,
                     53, 57, 61, 65, 69, 73, 77, 81, 85, 86, 87]
 REQUIRED_FILES = [
@@ -86,6 +88,23 @@ def main():
         if len(qtypes) != len(expected):
             fail(f"逐层 quant_type 数量不对: {len(qtypes)}")
         print(f"fa_v.scale    : {len(fa_scale)} 层（全注意力）OK")
+
+        # K 中心化整表：每层一份 <layer>.pt = [mu, mean_abs_k]，未按 TP 切片
+        center_dir = os.path.join(args.out_dir, "kv_center")
+        if not os.path.isdir(center_dir):
+            fail("缺少 kv_center/ —— K 中心化没做，运行时每层都会报错")
+        got = sorted(
+            int(name[:-3]) for name in os.listdir(center_dir) if name.endswith(".pt")
+        )
+        if got != expected:
+            fail(f"kv_center 层不对: 期望 {len(expected)} 层全注意力，"
+                 f"实际 {len(got)} 层，差异 {set(got) ^ set(expected)}")
+        sample = torch.load(
+            os.path.join(center_dir, f"{expected[0]}.pt"), weights_only=True
+        )
+        if sample.ndim != 3 or sample.shape[0] != 2:
+            fail(f"kv_center 形状异常: {tuple(sample.shape)}，期望 [2, nkv, head_dim]")
+        print(f"kv_center     : {len(got)} 层，shape={tuple(sample.shape)} OK")
     else:
         if fa_scale:
             print(f"[WARN] 出现 {len(fa_scale)} 层 fa_v.scale，v1 配方不应该有")
