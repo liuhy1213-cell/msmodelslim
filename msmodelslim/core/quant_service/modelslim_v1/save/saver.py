@@ -94,6 +94,7 @@ class AutoSaverProcessor(AutoSessionProcessor):
             qir.INT8FakeQuantActivationPerHead: self.on_int8_activation_per_head,
             qir.FP8FakeQuantActivationPerHead: self.on_fp8_activation_per_head,
             qir.MXFP8FakeQuantActivationPerChannel: self.on_mxfp8_activation_per_channel,
+            qir.HIF8FakeQuantActivationPerTensor: self.on_hif8_activation_per_tensor,
             qir.FakeQuantActivationPerToken: self.on_activation_per_token,
             qir.FakeQuantActivationPerBlock: self.on_activation_per_block,
             qir.W16A16sLinear: self.on_w16a16s,

@@ -70,6 +70,7 @@ class QDType(str, Enum):
     MXFP8 = "mxfp8"
     MXFP4 = "mxfp4"
     FP8_E4M3 = "fp8_e4m3"
+    HIFLOAT8 = "hifloat8"
 
     PLACEHOLDER = "placeholder"
 
@@ -172,6 +173,10 @@ class QStorage:
             self.value = self.value.to(torch.int8)
 
         if self.dtype == QDType.FP8_E4M3:
+            self.value = self.value.to(torch.float32)
+
+        # HiFloat8 没有独立的 torch dtype 承载；伪量化后保留 float32 的 hif8 网格值
+        if self.dtype == QDType.HIFLOAT8:
             self.value = self.value.to(torch.float32)
 
         return self

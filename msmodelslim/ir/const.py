@@ -47,6 +47,8 @@ int4_per_channel_sym = QScheme(scope=QScope.PER_CHANNEL, dtype=QDType.INT4, symm
 int4_per_group_asym = QScheme(scope=QScope.PER_GROUP, dtype=QDType.INT4, symmetric=False)
 int4_per_group_sym = QScheme(scope=QScope.PER_GROUP, dtype=QDType.INT4, symmetric=True)
 
+hif8_per_tensor_sym = QScheme(scope=QScope.PER_TENSOR, dtype=QDType.HIFLOAT8, symmetric=True)
+
 fp8_e4m3_per_token_sym = QScheme(scope=QScope.PER_TOKEN, dtype=QDType.FP8_E4M3, symmetric=True)
 fp8_e4m3_per_tensor_sym = QScheme(scope=QScope.PER_TENSOR, dtype=QDType.FP8_E4M3, symmetric=True)
 fp8_e4m3_per_channel_sym = QScheme(scope=QScope.PER_CHANNEL, dtype=QDType.FP8_E4M3, symmetric=True)

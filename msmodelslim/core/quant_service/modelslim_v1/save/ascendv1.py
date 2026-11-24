@@ -150,6 +150,7 @@ DTYPE_PREFIX_MAP = {
     QDType.INT8: "INT8",
     QDType.MXFP4: "MXFP4",
     QDType.MXFP8: "MXFP8",
+    QDType.HIFLOAT8: "HIF8",
 }
 
 
@@ -598,6 +599,13 @@ class AscendV1Saver(AutoSaverProcessor):
         # FA3 MXFP4/MXFP8 per-block 动态量化保存策略
         self.update_fa_quant_type(prefix, module)
 
+    def on_hif8_activation_per_tensor(self, prefix: str, module: qir.HIF8FakeQuantActivationPerTensor):
+        # FA HiFloat8 静态 per-tensor：每分支一个 float32 标量 scale（QFA descale 形状 (1,)）
+        scale = module.input_scale.to(torch.float32).reshape(1)
+        self.write_tensor(prefix + ".scale", "FAQuant", scale)
+        self.update_fa_quant_type(prefix, module)
+        self.update_global_fa_quant_type('FAKQuant')
+
     def on_mxfp8_activation_per_channel(self, prefix: str, module: qir.MXFP8FakeQuantActivationPerChannel):
         # FA MXFP8 per-channel 静态：scale 为 E8M0 shared_exp，导出为 uint8(exp + 127)
         shared_exp = module.input_scale.to(torch.float32)
@@ -624,8 +632,13 @@ class AscendV1Saver(AutoSaverProcessor):
         scope = module.x_q_scheme.scope
         is_dynamic = scope in (QScope.PER_TOKEN, QScope.PER_BLOCK)
         strategy = "DYNAMIC" if is_dynamic else "STATIC"
-        # per_channel 静态需在描述串中显式带 PER_CHANNEL（如 V_MXFP8_PER_CHANNEL）
-        scope_tag = "PER_CHANNEL" if scope == QScope.PER_CHANNEL else ""
+        # 静态非 per-head 分支需在描述串中显式带粒度（如 V_MXFP8_PER_CHANNEL、HIF8_PER_TENSOR）
+        if scope == QScope.PER_CHANNEL:
+            scope_tag = "PER_CHANNEL"
+        elif scope == QScope.PER_TENSOR:
+            scope_tag = "PER_TENSOR"
+        else:
+            scope_tag = ""
 
         if parent_prefix not in self.fa_quant_states:
             self.fa_quant_states[parent_prefix] = {}

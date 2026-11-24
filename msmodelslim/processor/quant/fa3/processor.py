@@ -157,6 +157,39 @@ class _FA3PerChannelObserver(nn.Module):
         self._dist_helper = dist_helper
 
 
+class _FA3PerTensorObserver(nn.Module):
+    """监测器：整个张量归约出一个 min/max（hif8 静态 per-tensor）。
+
+    scale = amax / max_abs_ratio，单独一个标量，与运行时 QFA 的 (1,) descale 对齐。
+    """
+
+    def __init__(self, name: str = ""):
+        super().__init__()
+        minmax_config = MinMaxObserverConfig(dim=[], keepdim=False, aggregation_type="max")
+        self._observer = MsMinMaxObserver(minmax_config)
+        self._dist_helper = None
+        self._name = name
+
+    @property
+    def min_val(self) -> Optional[torch.Tensor]:
+        impl = self._observer._impl
+        return getattr(impl, "min_val", None)
+
+    @property
+    def max_val(self) -> Optional[torch.Tensor]:
+        impl = self._observer._impl
+        return getattr(impl, "max_val", None)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        sync = self._dist_helper is not None and self._dist_helper.is_shared(self._name)
+        self._observer.update(x, sync=sync)
+        return x
+
+    def set_dist_helper(self, dist_helper: DistHelper):
+        self._dist_helper = dist_helper
+
+
 @QABCRegistry.register(dispatch_key=FA3QuantProcessorConfig, abc_class=AutoSessionProcessor)
 @logger_setter(prefix="msmodelslim.processor.fa3_quant")
 class FA3QuantProcessor(AutoSessionProcessor):
@@ -221,12 +254,14 @@ class FA3QuantProcessor(AutoSessionProcessor):
             if qconfig is None:
                 # 未配置分支：保留占位符（纯透传，零开销）
                 continue
-            if qconfig.scope not in (QScope.PER_HEAD, QScope.PER_CHANNEL):
+            if qconfig.scope not in (QScope.PER_HEAD, QScope.PER_CHANNEL, QScope.PER_TENSOR):
                 # PER_TOKEN / PER_BLOCK 为动态量化，数据无关，无需校准 observer；
                 # 保留占位符可避免校准阶段对 Q/K 做无谓统计（如 recall_window 排序）
                 continue
             if qconfig.scope == QScope.PER_CHANNEL:
                 observer = _FA3PerChannelObserver(name=name)
+            elif qconfig.scope == QScope.PER_TENSOR:
+                observer = _FA3PerTensorObserver(name=name)
             else:
                 observer = _FA3PerHeadObserver(ratio=submodule.get_ratio(), name=name)
             self.model.set_submodule(name, observer)
@@ -235,14 +270,16 @@ class FA3QuantProcessor(AutoSessionProcessor):
         if dist.is_initialized():
             self.dist_helper = DistHelper(request.module, prefix=request.name)
             for _, submodule in request.module.named_modules(prefix=request.name):
-                if not isinstance(submodule, (_FA3PerHeadObserver, _FA3PerChannelObserver)):
+                if not isinstance(submodule, (_FA3PerHeadObserver, _FA3PerChannelObserver, _FA3PerTensorObserver)):
                     continue
                 submodule.set_dist_helper(self.dist_helper)
 
     def postprocess(self, request: BatchProcessRequest) -> None:
         # 遍历所有 observer/占位符：静态 observer 先同步统计量再建 IR；动态占位符直接建动态 IR
         for name, submodule in request.module.named_modules(prefix=request.name):
-            if not isinstance(submodule, (FA3QuantPlaceHolder, _FA3PerHeadObserver, _FA3PerChannelObserver)):
+            if not isinstance(
+                submodule, (FA3QuantPlaceHolder, _FA3PerHeadObserver, _FA3PerChannelObserver, _FA3PerTensorObserver)
+            ):
                 continue
 
             fa_prefix = name.rsplit('.', 1)[-1]
@@ -252,7 +289,9 @@ class FA3QuantProcessor(AutoSessionProcessor):
                 get_logger().debug("No config for %s, skipping", name)
                 continue
 
-            is_observer = isinstance(submodule, (_FA3PerHeadObserver, _FA3PerChannelObserver))
+            is_observer = isinstance(
+                submodule, (_FA3PerHeadObserver, _FA3PerChannelObserver, _FA3PerTensorObserver)
+            )
 
             if qconfig.scope in (QScope.PER_TOKEN, QScope.PER_BLOCK):
                 # 动态量化：数据无关，占位符（或残留 observer）直接替换为动态 IR
@@ -271,6 +310,8 @@ class FA3QuantProcessor(AutoSessionProcessor):
                 self._process_per_head(qconfig, name, submodule)
             elif qconfig.scope == QScope.PER_CHANNEL:
                 self._process_per_channel(qconfig, name, submodule)
+            elif qconfig.scope == QScope.PER_TENSOR:
+                self._process_per_tensor(qconfig, name, submodule)
             else:
                 raise UnsupportedError(
                     f"fa3 quantization does not support following configuration:{qconfig}",
@@ -315,6 +356,26 @@ class FA3QuantProcessor(AutoSessionProcessor):
             q_dtype=fa_config.dtype,
             q_scope=fa_config.scope,
             symmetric=fa_config.symmetric,
+        )
+        fa_quantizer = qir.AutoFakeQuantActivation.create(q_param)
+        self.model.set_submodule(name, fa_quantizer)
+
+    def _process_per_tensor(self, fa_config: Union[QConfig, FA3AttentionDetails], name: str, submodule: nn.Module):
+        if submodule.min_val is None or submodule.max_val is None:
+            raise UnsupportedError(
+                f"FA3 per-tensor quantization at {name} collected no calibration data",
+                action="Please ensure a calibration run covers this attention path before postprocess",
+            )
+        amax = torch.maximum(submodule.min_val.abs(), submodule.max_val.abs())
+        # hif8 的 3 位尾数窗口约 [0.125, 16)：默认 scale = amax / 16
+        max_abs_ratio = fa_config.ext.get("max_abs_ratio", 16.0)
+        q_param = calculate_qparam(
+            min_val=-amax,
+            max_val=amax,
+            q_dtype=fa_config.dtype,
+            q_scope=fa_config.scope,
+            symmetric=fa_config.symmetric,
+            max_abs_ratio=max_abs_ratio,
         )
         fa_quantizer = qir.AutoFakeQuantActivation.create(q_param)
         self.model.set_submodule(name, fa_quantizer)

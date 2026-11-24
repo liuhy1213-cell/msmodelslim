@@ -40,6 +40,7 @@ from ..base import AutoActQuantizer, AutoWeightQuantizer, QConfig
         (qir.int8_per_tensor_sym, "minmax"),
         (qir.int8_per_tensor_asym, "minmax"),
         (qir.fp8_e4m3_per_tensor_sym, "minmax"),
+        (qir.hif8_per_tensor_sym, "minmax"),
     ],
     abc_type=AutoActQuantizer,
 )
@@ -56,12 +57,17 @@ class ActPerTensorMinmax(AutoActQuantizer):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         self.minmax_observer.update(x, self.sync)
         min_val, max_val = self.minmax_observer.get_min_max()
+        extra = {}
+        if "max_abs_ratio" in self.config.ext:
+            # hif8 per-tensor: amax / max_abs_ratio
+            extra["max_abs_ratio"] = self.config.ext["max_abs_ratio"]
         self.q_param = calculate_qparam(
             min_val=min_val,
             max_val=max_val,
             q_dtype=QDType(self.config.dtype),
             q_scope=QScope(self.config.scope),
             symmetric=self.config.symmetric,
+            **extra,
         )
         return fake_quantize(QStorage(dtype=QDType.FLOAT, value=x), self.q_param).value
 

@@ -1,0 +1,75 @@
+# IQuest-Q1 W8A8 + 全 C8 HiFloat8 (per-tensor) 量化配方
+#
+# 与 iquest_q1_w8a8c8_mxfp8.yaml 的唯一区别：
+#   线性层仍为 W8A8-MXFP8（per-block），FA Q/K/V 三分支全部改为
+#   HiFloat8 静态 per-tensor：每层每分支只导出 1 个 float32 scale
+#   （fa_{q,k,v}.scale，形状 (1,)），对应 QFA quant_mode=0 的 descale。
+#
+# 88 层全做（含滑窗层）：滑窗算子需要在 ops-transformer 侧放开
+# HIF8 + SLIDING_WINDOW（当前 patch 只放开了 MXFP8），见方案 §ops。
+#
+# scale 口径：amax / max_abs_ratio（默认 16）。hif8 的 3 位尾数窗口约
+# [0.125, 16)，不能沿用 int8/FP8 的 amax/max_norm。
+apiversion: modelslim_v1
+
+metadata:
+  config_id: iquest_q1_w8a8c8_hif8
+  score: 90
+  verified_model_types:
+    - IQuest-Q1
+  label:
+    w_bit: 8
+    a_bit: 8
+    is_sparse: False
+    kv_cache: True
+
+default_w8a8_dynamic: &mxfp8_w8a8
+  act:
+    scope: "per_block"
+    dtype: "mxfp8"
+    symmetric: True
+    method: "minmax"
+  weight:
+    scope: "per_block"
+    dtype: "mxfp8"
+    symmetric: True
+    method: "minmax"
+
+default_hif8_per_tensor: &hif8_per_tensor
+  dtype: "hifloat8"
+  scope: "per_tensor"
+  symmetric: True
+  method: "minmax"
+  ext:
+    max_abs_ratio: 16.0
+
+spec:
+  process:
+    # 权重/激活：attention + MoE 逐专家 + layer0 稠密 MLP（与 C8 MXFP8 配方一致）
+    - type: "linear_quant"
+      qconfig: *mxfp8_w8a8
+      include:
+        - "*self_attn*"
+        - "*mlp.experts*"
+        - "model.layers.0.mlp.gate_proj"
+        - "model.layers.0.mlp.up_proj"
+        - "model.layers.0.mlp.down_proj"
+      exclude:
+        - "*sink*"
+
+    # 全 88 层：Q/K/V 静态 per-tensor HiFloat8
+    - type: "fa3_quant"
+      details:
+        fa_q: *hif8_per_tensor
+        fa_k: *hif8_per_tensor
+        fa_v: *hif8_per_tensor
+      include:
+        - "*"
+      exclude:
+        - "*sink*"
+
+  dataset: qwen3_cot_w4a4.json
+
+  save:
+    - type: "ascendv1_saver"
+      part_file_size: 4
