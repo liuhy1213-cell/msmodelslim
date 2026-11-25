@@ -228,7 +228,10 @@ def encode_hif8(x: torch.Tensor, round_mode: str = DEFAULT_ROUND_MODE) -> torch.
     x_norm = x_abs[mask_normal]
     sign_norm = sign_int_value[mask_normal]
 
-    exponent = torch.floor(torch.log2(x_norm)).to(torch.int32)
+    # 精确取 floor(log2(x))：frexp 给出 x = m*2^e (m∈[0.5,1))，e-1 即二进制指数。
+    # torch.log2 在 binade 边界（含 subnormal）会因超越函数舍入差一，导致 dot 档/
+    # TA-SSR 舍入模式判错。
+    exponent = (torch.frexp(x_norm).exponent - 1).to(torch.int32)
     if round_mode == "hybrid":
         cut_bit_is_ta = torch.abs(exponent) < HYBRID_ROUND_EXP_THRESHOLD
     elif round_mode == "storound":

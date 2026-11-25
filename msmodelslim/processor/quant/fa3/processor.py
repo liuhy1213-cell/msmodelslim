@@ -336,6 +336,7 @@ class FA3QuantProcessor(AutoSessionProcessor):
             q_dtype=fa_config.dtype,
             q_scope=fa_config.scope,
             symmetric=fa_config.symmetric,
+            name=name,
         )
         fa_quantizer = qir.AutoFakeQuantActivation.create(q_param)
         self.model.set_submodule(name, fa_quantizer)
@@ -356,6 +357,7 @@ class FA3QuantProcessor(AutoSessionProcessor):
             q_dtype=fa_config.dtype,
             q_scope=fa_config.scope,
             symmetric=fa_config.symmetric,
+            name=name,
         )
         fa_quantizer = qir.AutoFakeQuantActivation.create(q_param)
         self.model.set_submodule(name, fa_quantizer)
@@ -376,6 +378,7 @@ class FA3QuantProcessor(AutoSessionProcessor):
             q_scope=fa_config.scope,
             symmetric=fa_config.symmetric,
             max_abs_ratio=max_abs_ratio,
+            name=name,
         )
         fa_quantizer = qir.AutoFakeQuantActivation.create(q_param)
         self.model.set_submodule(name, fa_quantizer)

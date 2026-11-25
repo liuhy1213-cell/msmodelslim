@@ -19,13 +19,31 @@ See the Mulan PSL v2 for more details.
 -------------------------------------------------------------------------
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
 from msmodelslim.ir.qal.qbase import QDType, QParam, QScope
 from msmodelslim.ir.qal.qbase import QStorage
 from msmodelslim.ir.qal.qregistry import QFuncRegistry
+from msmodelslim.utils.exception import SchemaValidateError
+
+
+def _raise_if_non_finite(label: str, value, name: Optional[str] = None) -> None:
+    """NaN/Inf 一旦进入 min/max 或 scale，会污染整个张量（甚至整个 checkpoint）。"""
+    tensor = value if torch.is_tensor(value) else torch.as_tensor(value)
+    if tensor.device.type == "meta" or tensor.numel() == 0:
+        return
+    if bool(torch.isfinite(tensor).all()):
+        return
+    nan = int(torch.isnan(tensor).sum())
+    inf = int(torch.isinf(tensor).sum())
+    where = f"（{name}）" if name else ""
+    raise SchemaValidateError(
+        f"{label}{where} 含非有限值：NaN={nan}, Inf={inf}",
+        action="请检查标定数据或溢出；单个 NaN/Inf 会让该张量的 scale/offset 全部失效，"
+        "进而污染导出的量化权重。",
+    )
 
 
 @QFuncRegistry.register_api(dispatch_key=Tuple[QDType, QScope, bool])
@@ -53,9 +71,24 @@ def calculate_qparam(
     Note:
         由于实现上的限制，并非所有的入参组合都是合法的，对于非法组合，QFuncRegistry.dispatch()接口将会抛出NotImplementedError异常。
     """
-    return QFuncRegistry.dispatch(
+    layer_name = kwargs.pop("name", None)
+    _raise_if_non_finite("量化统计量 min_val", min_val, layer_name)
+    _raise_if_non_finite("量化统计量 max_val", max_val, layer_name)
+    if torch.is_tensor(min_val) and torch.is_tensor(max_val) and min_val.shape == max_val.shape:
+        if bool((min_val > max_val).any()):
+            where = f"（{layer_name}）" if layer_name else ""
+            raise SchemaValidateError(
+                f"量化统计量 min_val > max_val{where}",
+                action="请检查标定数据或 observer 统计逻辑，非法统计会让 scale 失去意义。",
+            )
+    q_param = QFuncRegistry.dispatch(
         "calculate_qparam", (q_dtype, q_scope, symmetric), *(min_val, max_val, q_dtype, q_scope, symmetric), **kwargs
     )
+    ext = q_param.ext if isinstance(q_param.ext, dict) else {}
+    for key in ("scale", "offset"):
+        if key in ext:
+            _raise_if_non_finite(f"量化参数 {key}", ext[key], layer_name)
+    return q_param
 
 
 @QFuncRegistry.register_api(dispatch_key=Tuple[QDType, QDType, QScope, bool])
